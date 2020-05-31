@@ -1,0 +1,548 @@
+#include <math.h>
+
+#include <mpi.h>
+#include <omp.h>
+#include "mkl_poisson.h" // Fast poisson solver
+
+#include "pcm_utils.hpp"
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#include <assert.h>
+#include <time.h>
+#include <vector>
+
+//#include "cuda_code.h"
+
+#include <sys/sysinfo.h> 
+#include <sys/time.h>
+
+//#define N_DIM             19999 /*size in x dimension*/
+#define SIDE_LEN          1
+
+#define BLOCK_SIZE        1
+#define rho               1.0f
+#define mu                1.0f
+
+int nthreads;
+double delta_h;
+MKL_INT N_DIM;
+
+void get_node_info(int node_id){
+  struct sysinfo myinfo; 
+  unsigned long total_bytes; 
+  sysinfo(&myinfo); 
+  total_bytes = myinfo.mem_unit * myinfo.totalram; 
+  int max_threads = omp_get_num_procs();
+  printf("Node %d has %d threads\n",node_id,max_threads);
+  printf("With Main Memory: %lu GB\n", total_bytes/1024/1024/1024); 
+}
+
+void all_node_info(int max_nodes){
+	int node_id;
+	MPI_Comm_rank(MPI_COMM_WORLD, &node_id);
+	for(int i = 0 ; i < max_nodes; i++){
+		if(node_id == i){
+		  	get_node_info(node_id);
+//		  	device_info();
+		  	printf("======================================\n");
+		  }
+  		MPI_Barrier(MPI_COMM_WORLD);
+	}
+
+}
+
+/* OpenMP implementation of discrete laplacian*/
+void laplacian(std::vector<std::vector<double> >&u,std::vector<std::vector<double> >&newu){
+  int tid;
+  uint64_t i,j,Row_len,act_len;
+  double lap_u;
+  act_len = (N_DIM+1)/nthreads;
+  #pragma omp parallel private(tid,i,j,lap_u,Row_len)
+  {
+    tid = omp_get_thread_num(); 
+    if(tid != nthreads-1){
+      Row_len = (tid+1)*act_len; // How many rows each thread works on
+    }
+    else{
+      Row_len = N_DIM+1;
+    }
+    /* Compute the laplacian for row zero separately*/
+    if(tid == 0){
+      lap_u = 2*u[0][0]-2*u[0][1]+u[0][2]-2*u[1][0]+u[2][0];
+      newu[0][0] = (lap_u)/(delta_h*delta_h);    
+      for(j = 1; j< N_DIM; j++){
+        lap_u = u[0][j+1]-2*u[0][j]+u[0][j-1]+u[0][j]-2*u[1][j]+u[2][j];
+        newu[0][j] = (lap_u)/(delta_h*delta_h); 
+      }
+      lap_u = 2*u[0][N_DIM]-2*u[0][N_DIM-1]+u[0][N_DIM-2]-2*u[1][N_DIM]+u[2][N_DIM];
+      newu[0][N_DIM] = (lap_u)/(delta_h*delta_h);
+      for(i = 1; i < Row_len; i++){
+        lap_u = u[i+1][0]-u[i][0]+u[i-1][0]-2*u[i][1]+u[i][2];
+        newu[i][0] = (lap_u)/(delta_h*delta_h); 
+        for(j = 1; j < N_DIM; j++){
+            lap_u = u[i][j+1]-4*u[i][j]+u[i][j-1]+u[i+1][j]+u[i-1][j];
+            newu[i][j] = (lap_u)/(delta_h*delta_h); 
+        }  
+        lap_u = u[i+1][N_DIM]-u[i][N_DIM]+u[i-1][N_DIM]-2*u[i][N_DIM-1]+u[i][N_DIM-2];
+        newu[i][N_DIM] = (lap_u)/(delta_h*delta_h);
+      }
+    }
+    /* Compute the laplacian for row N_DIM separately*/
+    else if(tid == nthreads-1 && tid != 0){
+      //printf("asdfasdfasdf\n");
+      lap_u = 2*u[N_DIM][0]-2*u[N_DIM][1]+u[N_DIM][2]-2*u[N_DIM-1][0]+u[N_DIM-2][0];
+      newu[N_DIM][0] = (lap_u)/(delta_h*delta_h);    
+      for(j = 1; j < N_DIM; j++){
+        lap_u = u[N_DIM][j+1]-u[N_DIM][j]+u[N_DIM][j-1]-2*u[N_DIM-1][j]+u[N_DIM-2][j];
+        newu[N_DIM][j] = (lap_u)/(delta_h*delta_h); 
+      }  
+      lap_u = 2*u[N_DIM][N_DIM]-2*u[N_DIM][N_DIM-1]+u[N_DIM][N_DIM-2]-2*u[N_DIM-1][N_DIM]+u[N_DIM-2][N_DIM];
+      newu[N_DIM][N_DIM] = (lap_u)/(delta_h*delta_h);
+      for(i = tid*act_len; i < N_DIM; i++){
+        lap_u = u[i][0]-2*u[i][1]+u[i][2]+u[i+1][0]-2*u[i][0]+u[i-1][0];
+        newu[i][0] = (lap_u)/(delta_h*delta_h);  
+        for(j = 1; j< N_DIM; j++){
+          lap_u = u[i][j+1]-4*u[i][j]+u[i][j-1]+u[i+1][j]+u[i-1][j];
+          newu[i][j] = (lap_u)/(delta_h*delta_h);  
+        }  
+        lap_u = u[i][N_DIM]-2*u[i][N_DIM-1]+u[i][N_DIM-2]+u[i+1][N_DIM]-2*u[i][N_DIM]+u[i-1][N_DIM];
+        newu[i][N_DIM] = (lap_u)/(delta_h*delta_h);
+      }
+    }
+    /* Compute the laplacian for internal rows*/
+    else{
+      for(i = tid*act_len; i < Row_len; i++){
+        lap_u = u[i+1][0]-u[i][0]+u[i-1][0]-2*u[i][1]+u[i][2];
+        newu[i][0] = (lap_u)/(delta_h*delta_h); 
+        for(j = 1; j < N_DIM; j++){
+          lap_u = u[i][j+1]-4*u[i][j]+u[i][j-1]+u[i+1][j]+u[i-1][j];
+          newu[i][j] = (lap_u)/(delta_h*delta_h); 
+        }  
+        lap_u = u[i+1][N_DIM]-u[i][N_DIM]+u[i-1][N_DIM]-2*u[i][N_DIM-1]+u[i][N_DIM-2];
+        newu[i][N_DIM] = (lap_u)/(delta_h*delta_h);
+      }
+    } 
+  }
+}
+
+void print_vel(std::vector<std::vector<double> >&u, std::vector<std::vector<double> >&v, uint64_t N){
+    for(int j = N-1; j >=0; j--){
+    for(int i = 0; i < N; i++){
+      printf("<%f,%f> ",u[i][j],v[i][j]);
+       //printf("(%f)=%f ",b[i][j],p[i][j]);
+    }
+    printf("\n");
+  } 
+}
+
+void print_vel_norm(std::vector<std::vector<double> >&u, std::vector<std::vector<double> >&v, uint64_t N){
+    for(int j = N-1; j >=0; j--){
+    for(int i = 0; i < N; i++){
+      printf("%f ",sqrt(u[i][j]*u[i][j]+v[i][j]*v[i][j]));
+       //printf("(%f)=%f ",b[i][j],p[i][j]);
+    }
+    printf("\n");
+  } 
+}
+
+void print_value(std::vector<std::vector<double> >&u, uint64_t N){
+    for(int j = N-1; j >=0; j--){
+    for(int i = 0; i < N; i++){
+      printf("%f ",u[i][j]);
+       //printf("(%f)=%f ",b[i][j],p[i][j]);
+    }
+    printf("\n");
+  } 
+}
+
+void print_value_list(double *u,uint64_t N){
+    for(int j = N-1; j >=0; j--){
+    for(int i = 0; i < N; i++){
+      printf("%f ",u[i+j*N]);
+       //printf("(%f)=%f ",b[i][j],p[i][j]);
+    }
+    printf("\n");
+  } 
+}
+
+int main(int argc, char *argv[]){
+  int cpu_list[2] = {0,2};
+  set_cpu(cpu_list,2);
+  /*id = node number
+    num_node = number of nodes
+    provided = level of threading provided by MPI, we expect to have 3.*/
+  int node_id,num_node, provided; 
+  
+  int ierr = MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided); /* Pass arguments to all nodes*/
+  
+  /* Get node id and node size*/
+  ierr = MPI_Comm_size(MPI_COMM_WORLD, &num_node);
+  ierr = MPI_Comm_rank(MPI_COMM_WORLD, &node_id);
+  
+  if(node_id == 0){
+  	/* Print the thread level provided by MPI library */
+  	printf("Thread level provided by MPI library: %d\n",provided);
+
+  }
+
+  /* Can be used to find out node information */
+
+  all_node_info(num_node);
+  
+  /* Find out which GPU devices have more than 6GB memory */
+//  init_gpu_devices();
+
+
+  /* Get thread info and set thread number based on command line argument*/
+  int tid;
+  nthreads = atoi(argv[1]);
+  N_DIM = (MKL_INT)atoi(argv[2]);
+  uint64_t N = N_DIM+1;
+  uint64_t NN = N*N, spar_size = (13*N_DIM/2+7);
+  delta_h = (SIDE_LEN*1.0)/(1.0*N_DIM);
+  double delta_t = 0.001,t = 0;
+
+  /* set the number of threads each nodes will use, this is passed from the command line 
+  tid = thread id */
+  omp_set_num_threads(nthreads);
+
+  /* Set up poisson solver*/
+  double pi=3.14159265358979324;
+
+  //MKL_INT ix, iy, i, 
+  MKL_INT stat;
+  MKL_INT ipar[128];
+  double ax, bx, ay, by, lx, ly, hx, hy;
+  double *spar, *bd_ax, *bd_bx, *bd_ay, *bd_by, *p;
+  double q;
+  DFTI_DESCRIPTOR_HANDLE xhandle = 0;
+  char *BCtype;
+  uint64_t i,j,Row_len,act_len;
+
+  p = (double*)malloc(NN*sizeof(double));
+  spar=(double*)malloc(spar_size*sizeof(double));
+  bd_ax=(double*)malloc(N*sizeof(double));
+  bd_bx=(double*)malloc(N*sizeof(double));
+  bd_ay=(double*)malloc(N*sizeof(double));
+  bd_by=(double*)malloc(N*sizeof(double));
+
+/* Defining the rectangular domain 0<x<1, 0<y<1 for 2D Poisson Solver */
+  ax = 0.0E0;
+  bx = 1.0E0;
+  ay = 0.0E0;
+  by = 1.0E0;
+
+  /*******************************************************************************
+  Setting the coefficient q to 0.
+  Note that this is the way to use Helmholtz Solver to solve Poisson problem!
+  *******************************************************************************/
+  q = 0.0E0;
+
+  /* Computing the mesh size hx in x-direction */
+  lx=bx-ax;
+  hx=lx/N_DIM;
+  /* Computing the mesh size hy in y-direction */
+  ly=by-ay;
+  hy=ly/N_DIM;
+
+  BCtype = "NNND";
+
+  /* Setting the values of the boundary function G(x,y) that is equal to the TRUE solution
+  in the mesh points laying on Dirichlet boundaries */
+  for(i=0; i < N; i++){
+    bd_by[i] = 0.0;
+    bd_ay[i] = 0.0;
+    /* y direction*/
+    bd_ax[i] = 0.0;
+    bd_bx[i] = 0.0;
+  }
+
+  /* Initializing ipar array to make it free from garbage */
+  for(i=0;i<128;i++){
+    ipar[i]=0;
+  }
+
+  d_init_Helmholtz_2D(&ax, &bx, &ay, &by, &N_DIM, &N_DIM, BCtype, &q, ipar, spar, &stat);
+  d_commit_Helmholtz_2D(p, bd_ax, bd_bx, bd_ay, bd_by, &xhandle, ipar, spar, &stat);
+  /* Allocate memory for u,v,p, and other stuff*/
+
+  std::vector< std::vector<double> > u;
+  std::vector< std::vector<double> > v;
+  std::vector< std::vector<double> > newu;
+  std::vector< std::vector<double> > newv;
+  std::vector< std::vector<double> > newp;
+  std::vector< std::vector<double> > Px;
+  std::vector< std::vector<double> > Py;
+  std::vector< std::vector<double> > b;
+  std::vector< std::vector<double> > P;
+  u.resize(N);
+  v.resize(N);
+  b.resize(N);
+  newu.resize(N);
+  newv.resize(N);
+  newp.resize(N);
+  Px.resize(N);
+  P.resize(N);
+  Py.resize(N);     
+
+  for(int i = 0 ; i < N ; ++i){
+	u[i].resize(N);
+	v[i].resize(N);
+	newu[i].resize(N);
+	newv[i].resize(N);
+        Px[i].resize(N);
+  	Py[i].resize(N);  
+	P[i].resize(N); 
+	b[i].resize(N); 
+        newp[i].resize(N);
+  }
+  for(int i = 0; i < N;i++){
+    for(int j = 0; j < N; j++){
+	    u[i][j] = 0;
+            v[i][j] = 0;
+            P[i][j] = 0;
+      if(j == N-1){
+        u[i][j] = 1.0;
+      }
+     }
+  }
+  //printf("Initial velocity\n");
+  //print_vel(u,v,N);
+
+  printf("Done allocating memory for u,v,p, with h=%f\n",delta_h);
+
+  //printf("asdfasdfasdf\n");
+  // double uxx,uyy,vxx,vyy;
+  double ux,vy,uy,vx,px,py;
+
+  struct timeval  tv1, tv2;
+
+
+  for(int k = 0; k < atoi(argv[3]); k++){
+  /* Version 3 */
+  gettimeofday(&tv1, NULL);
+  /* Measure Cache Misses */
+  //start_core_measure(0); 
+  laplacian(u,newu);
+  //end_core_measure(0);
+  laplacian(v,newv);
+
+  //printf("Laplacian at %d\n",k);
+  //print_vel(newu,newv,N);
+
+  act_len = (N_DIM+1)/nthreads;
+  //start_core_measure(0);   
+  #pragma omp parallel private(tid,i,j,Row_len,ux,uy,vx,vy)
+  {
+    tid = omp_get_thread_num();  
+    
+    if(tid != nthreads-1){
+      Row_len = (tid+1)*act_len; // How many rows each thread works on
+    }
+    else{
+      Row_len = N_DIM+1;
+    }
+    //printf("tid = %d, with act_len = %d, and row_len = %d\n",tid,act_len,Row_len); 
+    for(i = tid*act_len; i < Row_len; i++){
+      for(j = 0; j<= N_DIM; j++){
+     // For convective term
+      // uy
+        if(j == 0){
+          uy = (-3*u[i][j]+4*u[i][j+1]-u[i][j+2])/(delta_h*2);
+        }
+        else if (j == N_DIM){
+          uy = (3*u[i][j]-4*u[i][j-1]+u[i][j-2])/(delta_h*2);
+        }
+        else{
+          uy = (u[i][j+1]-u[i][j-1])/(delta_h*2);
+            }
+      // ux
+        if(i == 0){
+          ux = (-3*u[i][j]+4*u[i+1][j]-u[i+2][j])/(delta_h*2);
+        }
+        else if (i == N_DIM){
+          ux = (3*u[i][j]-4*u[i-1][j]+u[i-2][j])/(delta_h*2);
+        }
+        else{
+          ux = (u[i+1][j]-u[i-1][j])/(delta_h*2);
+            }
+      // update newu
+        newu[i][j] = newu[i][j]-(u[i][j]*ux+v[i][j]*uy);
+      // uvx
+        if(j == 0){
+          vy = (-3*v[i][j]+4*v[i][j+1]-v[i][j+2])/(delta_h*2);
+        }
+        else if (j == N_DIM){
+          vy = (3*v[i][j]-4*v[i][j-1]+v[i][j-2])/(delta_h*2);
+        }
+        else{
+          vy = (v[i][j+1]-v[i][j-1])/(delta_h*2);
+            }
+      // vuy
+        if(i == 0){
+          vx = (-3*v[i][j]+4*v[i+1][j]-v[i+2][j])/(delta_h*2);
+        }
+        else if (i == N_DIM){
+          vx = (3*v[i][j]-4*v[i-1][j]+v[i-2][j])/(delta_h*2);
+        }
+        else{
+          vx = (v[i+1][j]-v[i-1][j])/(delta_h*2);
+            }
+      // update newv
+        newv[i][j] = newv[i][j]-(u[i][j]*vx+v[i][j]*vy);
+        //p[i+j*N] = -rho*(ux*ux+vy*vy+2*vx*uy - (ux+vy)/delta_t);
+        b[i][j] = -rho*delta_h/4*(ux*ux+vy*vy+2*vx*uy - (ux+vy)/delta_t);
+        //if(i == N-1) printf("(%f) - (%f,%f,%f,%f) ",p[i*N+j],ux,uy,vx,vy);   
+    }  
+   }   
+  } 
+printf("asdfasdf\n");
+  //end_core_measure(0);
+  /* Solve the Pressure Poisson equation */
+	uint64_t l,num_it = 100;
+	for(l = 0; l < num_it; l++){
+		  for(i = 1; i < N-1; i++){
+			for(j = 1; j < N-1; j++){
+		 		newp[i][j] = (P[i+1][j]+P[i-1][j]+P[i][j+1]+P[i][j-1])/4+b[i][j];
+		  	} 
+		  }
+printf("asdfasdf\n");
+		  for(i = 0; i < N; i++){
+		  	newp[i][N-1] = 0; //y=1
+		  }
+		  for(i = 0; i < N; i++){
+		  	newp[i][0] = newp[i][1]; // y=0
+		  }
+		  for(j = 0; j < N; j++){
+		  	newp[0][j] = newp[1][j]; //x=0
+		  }
+		  for(j = 0; j < N; j++){
+		  	newp[N-1][j] = newp[N-2][j]; //x=1
+		  }
+		  for(i = 0; i < N; i++){
+			for(j = 0; j < N; j++){
+		 		P[i][j] = newp[i][j]; // copying
+		  	} 
+		  }
+	}
+printf("asdfasdf\n");
+ /* for(i=0;i<N;i++)
+  {
+    for(j=0;j<N;j++)
+    {
+      double xi=hx*i/lx;
+      double yi=hy*j/ly;
+
+      //u[ix+iy*(nx+1)]=1.0E0*cx*cy;
+      p[i+j*N]=cos(pi/2*yi)*((-1/4.0)*pi*pi);
+      //u[ix+iy*(nx+1)]=u[ix+iy*(nx+1)]+1.0E0;
+    }
+  }*/
+  //printf("RHS\n");
+  //print_value_list(p,N);
+
+  //d_Helmholtz_2D(p, bd_ax, bd_bx, bd_ay, bd_by, &xhandle, ipar, spar, &stat); 
+  #pragma omp parallel private(tid,i,j,Row_len,px,py) // Compute the pressure gradient
+  {
+    tid = omp_get_thread_num();  
+    
+    if(tid != nthreads-1){
+      Row_len = (tid+1)*act_len; // How many rows each thread works on
+    }
+    else{
+      Row_len = N_DIM+1;
+    }
+    //printf("tid = %d, with act_len = %d, and row_len = %d\n",tid,act_len,Row_len); 
+    for(i = tid*act_len; i < Row_len; i++){
+      for(j = 0; j<= N_DIM; j++){
+     // Gradient of p
+      // px
+        if(j == 0){
+          //py = (-3*p[i+j*N]+4*p[i+(j+1)*N]-p[i+(j+2)*N])/(delta_h*2);
+        }
+        else if (j == N_DIM){
+          //py = (3*p[i+j*N]-4*p[i+(j-1)*N]+p[i+(j-2)*N])/(delta_h*2);
+        }
+        else{
+          //py = (p[i+(j+1)*N]-p[i+(j-1)*N])/(delta_h*2);
+            py = (P[i][j+1]-P[i][j-1])/(delta_h*2);
+            }
+      // py
+        if(i == 0){
+          //px = (-3*p[i+j*N]+4*p[i+1+j*N]-p[i+2+j*N])/(delta_h*2);
+        }
+        else if (i == N_DIM){
+          //px = (3*p[i+j*N]-4*p[i-1+j*N]+p[i-2+j*N])/(delta_h*2);
+        }
+        else{
+          //px = (p[i+1+j*N]-p[i-1+j*N])/(delta_h*2);
+            px = (P[i+1][j]-P[i-1][j])/(delta_h*2);
+            }
+        Px[i][j] = px;
+        Py[i][j] = py;
+      // update newu
+        if(i != 0 && i != N-1 && j != 0 && j != N-1){
+          u[i][j] = u[i][j]+delta_t*(newu[i][j]-px);
+          v[i][j] = v[i][j]+delta_t*(newv[i][j]-py);
+          assert(u[i][j] == u[i][j] || v[i][j] == v[i][j]);
+        }
+        
+    }  
+   }  
+  } 
+  //printf("velocity at %d\n",k);
+  //print_vel(u,v,N);
+  //printf("P\n");
+  //print_value_list(p,N);
+  //printf("gradient p\n");
+  //print_vel(Px,Py,N);
+
+  //printf("*******************************************\n");  
+  //printf("*******************************************\n"); 
+  //printf("*******************************************\n"); 
+  //printf("*******************************************\n"); 
+  gettimeofday(&tv2, NULL);
+  t += delta_t;
+  double res_time = (double) (tv2.tv_usec - tv1.tv_usec) / 1000000 + (double) (tv2.tv_sec - tv1.tv_sec);
+  printf ("Total time = %f seconds with %f Gflops (vector, separate u/v,loop breaking)\n",res_time,(12.0*(N)/1000000000.0)*(N)/res_time);
+  printf("Current time t = %f\n",t);
+  }
+  //printf("velocity\n");
+  //print_vel(u,v,N);
+  double max_vel = 0;
+  double xp,yp;
+  for(int i = 0; i < N; i++){
+    for(int j = 0; j < N; j++){
+      if(max_vel < u[i][j]*u[i][j]+v[i][j]*v[i][j]){
+        max_vel = u[i][j]*u[i][j]+v[i][j]*v[i][j];
+        xp = i*delta_h;
+        yp = j*delta_h;
+      }
+    }
+  }
+  printf("Max velocity %f at (%f,%f)\n",max_vel,xp,yp);
+  /*for(int j = N-1; j >=N-10; j--){
+    for(int i = 0; i < 5; i++){
+      printf("<%f,%f> ",u[i][j],v[i][j]);
+       //printf("(%f)=%f ",b[i][j],p[i][j]);
+    }
+    printf("\n");
+  } */
+  //print_vel(u,v,N);
+  /* Cleanup */
+
+  free_Helmholtz_2D(&xhandle, ipar, &stat);
+  free(p);
+  free(spar);
+  free(bd_ax);
+  free(bd_bx);
+  free(bd_ay);
+  free(bd_by);
+
+  /* End of MPI codes */
+  ierr = MPI_Finalize();
+  return 0;
+}

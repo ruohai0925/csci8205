@@ -1,0 +1,8 @@
+program: main.o cuda_code.o
+	mpiicc -I/usr/local/cuda-9.1/include -L/usr/local/cuda-9.1/lib64 -lcudart -lcublas -qopenmp -mt_mpi main.o cuda_code.o -o test
+
+cuda_code.o: cuda_code.cu
+	nvcc -arch=sm_30 -c cuda_code.cu -o cuda_code.o
+
+main.o: main.c
+	mpiicc -O2 -mt_mpi -c main.c -fopenmp -o main.o

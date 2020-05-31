@@ -1,0 +1,56 @@
+/* 
+  ============================================================= 
+  Simple array to test transfer to different node
+  Multi-Threaded
+  =============================================================
+  */
+  if( node_id == 0){
+  	printf("===================================\n");
+  	printf("Node %d: setting up list (2.0)\n",node_id);
+  	for(uint64_t i = 0; i < buffer_len; i++){
+  	  list[i] = 2.0;
+  	}
+  }
+  /* Testing transfer rate for multiple threads */
+  int sub_len = 0, inc_len = 0;
+  start = MPI_Wtime();
+  #pragma omp parallel private(tid,sub_len,inc_len,send_request)
+  {
+    tid = omp_get_thread_num();
+    inc_len = buffer_len/nthreads;
+    if(tid == nthreads - 1){
+    	sub_len = buffer_len - (nthreads-1)*inc_len;
+    }
+    else{
+    	sub_len = inc_len;
+    }
+	//printf("Thread %d/%d of node %d has sub length %d\n",tid,nthreads,node_id, inc_len);
+
+	if (node_id == 0){
+		printf("Thread %d/%d of node %d starting send\n",tid,nthreads,node_id);
+		MPI_Isend(list+tid*inc_len,sub_len, MPI_DOUBLE, 1, tid, MPI_COMM_WORLD,&send_request);
+		//MPI_Wait(&recv_request, &status);
+
+  	} else if (node_id == 1) {
+		MPI_Irecv(list+tid*inc_len, sub_len, MPI_DOUBLE, 0, tid, MPI_COMM_WORLD,&send_request);
+			//MPI_STATUS_IGNORE);
+		//MPI_Wait(&send_request, &status);
+		//printf("Thread %d/%d of node %d finished recv\n",tid,nthreads,node_id);
+  	}
+	MPI_Wait(&send_request, &status);
+	printf("Thread %d/%d of node %d ending\n",tid,nthreads,node_id);
+  }  
+  //MPI_Barrier(MPI_COMM_WORLD);
+  end = MPI_Wtime();
+
+  if (node_id == 0) { /* use time on master node */
+    printf("Time for transferring with %d threads: %f\n", nthreads, end-start);
+  }
+
+  if(node_id == 1){
+  	printf("Node %d: checking list values (2.0)\n",node_id);
+  	for(uint64_t i = 0; i < buffer_len; i++){
+  	  if(list[i] != 2.0) printf("Failed at i = %d with list[i] = %lf\n",i,list[i]);
+  	  assert(list[i] == 2.0); 
+  	}
+  }

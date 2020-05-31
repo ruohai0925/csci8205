@@ -1,0 +1,206 @@
+#include <math.h>
+
+#include <mpi.h>
+#include <omp.h>
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#include <assert.h>
+#include <time.h>
+
+//#include "cuda_code.h"
+
+#include <sys/sysinfo.h> 
+
+
+#define N_DIM             100 /*size in x dimension*/
+#define SIDE_LEN          1
+
+#define BLOCK_SIZE        4
+
+#define buffer_len 200000
+
+void get_node_info(int node_id){
+  struct sysinfo myinfo; 
+  unsigned long total_bytes; 
+  sysinfo(&myinfo); 
+  total_bytes = myinfo.mem_unit * myinfo.totalram; 
+  int max_threads = omp_get_num_procs();
+  printf("Node %d has %d threads\n",node_id,max_threads);
+  printf("With Main Memory: %lu GB\n", total_bytes/1024/1024/1024); 
+}
+
+void all_node_info(int max_nodes){
+	int node_id;
+	MPI_Comm_rank(MPI_COMM_WORLD, &node_id);
+	for(int i = 0 ; i < max_nodes; i++){
+		if(node_id == i){
+		  	get_node_info(node_id);
+//		  	device_info();
+		  	printf("======================================\n");
+		  }
+  		MPI_Barrier(MPI_COMM_WORLD);
+	}
+
+}
+
+int main(int argc, char *argv[]){
+  /*id = node number
+    num_node = number of nodes
+    provided = level of threading provided by MPI, we expect to have 3.*/
+  int node_id,num_node, provided; 
+  
+  int ierr = MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided); /* Pass arguments to all nodes*/
+  
+  /* Get node id and node size*/
+  ierr = MPI_Comm_size(MPI_COMM_WORLD, &num_node);
+  ierr = MPI_Comm_rank(MPI_COMM_WORLD, &node_id);
+  
+  if(node_id == 0){
+  	/* Print the thread level provided by MPI library */
+  	printf("Thread level provided by MPI library: %d\n",provided);
+
+  }
+
+
+
+  /* Can be used to find out node information */
+
+  all_node_info(num_node);
+  
+  /* Find out which GPU devices have more than 6GB memory */
+//  init_gpu_devices();
+
+  /* Allocate memory for u,v,p, and other stuff*/
+  double delta_h = SIDE_LEN/N_DIM;
+
+  
+  /* Get thread info and set thread number based on command line argument*/
+  int tid,nthreads = atoi(argv[1]);
+
+  /* set the number of threads each nodes will use, this is passed from the command line 
+	tid = thread id */
+  omp_set_num_threads(nthreads);
+  uint64_t i;
+
+  /* 
+  ============================================================= 
+  Simple array to test transfer to different node with Send/Recv
+  Single Threaded
+  =============================================================
+  */
+  double *list = (double*) malloc(buffer_len*sizeof(double));
+  if( node_id == 0){
+  	printf("Node %d: setting up list (1.0)\n",node_id);
+  	for(i = 0; i < buffer_len; i++){
+  	  list[i] = 1.0;
+  	}
+  }
+  /* Testing transfer rate for one node. */
+  double start, end;
+  start = MPI_Wtime();
+  if (node_id == 0){
+	MPI_Send(list,buffer_len, MPI_DOUBLE, 1, 0, MPI_COMM_WORLD);
+
+  } else if (node_id == 1) {
+	MPI_Recv(list, buffer_len, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD,
+		       MPI_STATUS_IGNORE);
+  }
+  //MPI_Barrier(MPI_COMM_WORLD);
+  end = MPI_Wtime();
+
+  if (node_id == 0) { /* use time on master node */
+    printf("Time for transferring (Send/Recv) with one thread: %f\n", end-start);
+  }
+
+  if(node_id == 1){
+  	printf("Node %d: checking list values (1.0)\n",node_id);
+  	for(i = 0; i < buffer_len; i++){
+  	  assert(list[i] == 1.0); 
+  	}
+  }
+  
+  MPI_Barrier(MPI_COMM_WORLD);
+
+
+
+  /* 
+  ============================================================= 
+  Simple array to test transfer to different node with Isend/recv
+  Single Threaded
+  =============================================================
+  */
+  MPI_Request	send_request,recv_request;
+  MPI_Status status;
+  if( node_id == 0){
+  	printf("Node %d: setting up list (1.5)\n",node_id);
+  	for(i = 0; i < buffer_len; i++){
+  	  list[i] = i;
+  	}
+  }
+  /* Testing transfer rate for one node. */
+  start = MPI_Wtime();
+  if (node_id == 0){
+	MPI_Isend(list,buffer_len, MPI_DOUBLE, 1, 0, MPI_COMM_WORLD, &send_request);
+
+  } else if (node_id == 1) {
+	MPI_Irecv(list, buffer_len, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD,&send_request);
+  }
+  MPI_Wait(&send_request,&status);
+  //MPI_Wait(&recv_request,&status);
+  //MPI_Barrier(MPI_COMM_WORLD);
+  end = MPI_Wtime();
+
+  if (node_id == 0) { /* use time on master node */
+    printf("Time for transferring (Isend/recv) with one thread: %f\n", end-start);
+  }
+
+  if(node_id == 1){
+  	printf("Node %d: checking list values (1.5)\n",node_id);
+  	for(i = 0; i < buffer_len; i++){
+  	  assert(list[i] == i); 
+  	}
+  }
+  
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  /* Fork a team of threads giving them their own copies of variables */
+  if(node_id == 1){
+	  #pragma omp parallel private(tid,i)
+	  {
+	  /* Obtain thread number */
+	  tid = omp_get_thread_num();
+	  printf("Thread %d/%d of node %d to begin modifying\n",tid,nthreads,node_id);
+	  for(i = tid; i < buffer_len; i += nthreads){
+	  	list[i] = 2.0;
+	  }
+	  //printf("Hello World from thread = %d of node %d\n", tid, node_id);
+
+	  }  /* All threads join master thread and disband */
+  }
+  if (node_id == 1){
+	MPI_Send(list,buffer_len, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD);
+
+  } else if (node_id == 0) {
+	MPI_Recv(list, buffer_len, MPI_DOUBLE, 1, 0, MPI_COMM_WORLD,
+		       MPI_STATUS_IGNORE);
+  }
+
+  if(node_id == 0){
+  	printf("Node %d: checking list values\n",node_id);
+  	for(i = 0; i < buffer_len; i++){
+  	  assert(list[i] == 2.0); 
+  	}
+  }
+
+  /* Cleanup */
+  free(list);
+
+
+
+  /* End of MPI codes */
+  ierr = MPI_Finalize();
+  return 0;
+}

@@ -1,0 +1,17 @@
+!_TAG_FILE_FORMAT	2	/extended format; --format=1 will not append ;" to lines/
+!_TAG_FILE_SORTED	1	/0=unsorted, 1=sorted, 2=foldcase/
+!_TAG_PROGRAM_AUTHOR	Darren Hiebert	/dhiebert@users.sourceforge.net/
+!_TAG_PROGRAM_NAME	Exuberant Ctags	//
+!_TAG_PROGRAM_URL	http://ctags.sourceforge.net	/official site/
+!_TAG_PROGRAM_VERSION	5.8	//
+BLOCK_SIZE	main.cpp	22;"	d	file:
+CUDA_CODE_H	cuda_code.h	2;"	d
+N_DIM	main.cpp	/^uint64_t N_DIM;$/;"	v
+SIDE_LEN	main.cpp	20;"	d	file:
+all_node_info	main.cpp	/^void all_node_info(int max_nodes){$/;"	f
+delta_h	main.cpp	/^double delta_h;$/;"	v
+get_node_info	main.cpp	/^void get_node_info(int node_id){$/;"	f
+laplacian	main.cpp	/^void laplacian(std::vector<std::vector<double> >&u,std::vector<std::vector<double> >&newu){$/;"	f
+laplacian_blocking	main.cpp	/^void laplacian_blocking(std::vector<std::vector<double> >&u,std::vector<std::vector<double> >&newu){$/;"	f
+main	main.cpp	/^int main(int argc, char *argv[]){$/;"	f
+nthreads	main.cpp	/^int nthreads;$/;"	v
